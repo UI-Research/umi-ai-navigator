@@ -1,0 +1,1450 @@
+---
+title: "UMI AI Evaluation Analysis Round 2"
+
+format:
+  html:
+    theme: cosmo
+    toc: true
+    number-sections: true
+    toc-location: left
+    toc-depth: 5
+    code-fold: true
+    smooth-scroll: true
+    df-print: paged
+    embed-resources: true
+    mainfont: Lato
+
+execute: 
+  echo: false
+  warning: false
+  message: false
+  error: false
+
+jupyter: python3
+---
+
+# Executive Summary
+
+```{python}
+# Executive summary is generated dynamically after data loading — see cell below.
+```
+
+```{python}
+import pandas as pd
+import boto3
+import json
+from IPython.display import Markdown, display
+from config import BUCKET_NAME, SHINY_BUCKET_NAME
+
+pd.options.display.float_format = "{:.2f}".format
+pd.set_option("display.max_colwidth", 80)
+```
+
+```{python}
+# Load human evaluation data from S3
+s3_folder = "finished-human-evaluations/"
+human_eval_file_1 = "shiny-input_2026-04-08_evaluator_a.csv"
+human_eval_file_2 = "shiny-input_2026-04-08_evaluator_d.csv"
+human_eval_file_3 = "shiny-input_2026-04-08_evaluator_c.csv"
+
+s3 = boto3.client("s3")
+
+responses = []
+
+for file in [human_eval_file_1, human_eval_file_2, human_eval_file_3]:
+    response = s3.get_object(Bucket=SHINY_BUCKET_NAME, Key=f"{s3_folder}{file}")
+    df = pd.read_csv(response["Body"])
+    responses.append(df)
+```
+
+```{python}
+# Clean and combine the data
+df = pd.concat(responses, ignore_index=True)
+
+df.drop(columns=['error', 'open_ended_feedback'], inplace=True, errors='ignore')
+df["references_avg"] = df[["references_1", "references_2", "references_3", "references_4", "references_5"]].mean(axis=1)
+df.rename(columns={
+    "accuracy_1": "Accuracy",
+    "relevancy_1": "Relevancy",
+    "completeness_1": "Completeness",
+    "confidence_1": "Uncertainty",
+    "confidence_2": "Refusal",
+    "bias_1": "Bias",
+    "references_avg": "References",
+    "recommend_1": "Recommend"
+}, inplace=True)
+
+eval_cols = ['Accuracy', 'Relevancy', 'Completeness', 'Uncertainty', 'Refusal', 'Bias', 'References', 'Recommend']
+
+df['question_id'] = df.apply(
+    lambda row: f"t{row['task_number']}-q{row['prompt_number']}", axis=1
+)
+
+df_evals = df[~df[eval_cols].isna().all(axis=1)]
+
+_task_cat_rename = {
+    "Extractive QA": "Extractive Q&A",
+    "Single-hop reasoning": "Singlehop reasoning",
+    "Multi-hop reasoning": "Multihop reasoning",
+    "Contrast QA": "Contrast Q&A",
+    "Long-form QA": "Long-form Q&A",
+    "Out of Bounds": "Out of bounds",
+}
+df_evals["Task Category"] = df_evals["Task Category"].replace(_task_cat_rename)
+```
+
+```{python}
+# Load automated evaluation data
+s3_output_folder = "output/"
+auto_eval_file = "auto_eval_20260407_162219_updated_results.json"
+response = s3.get_object(Bucket=BUCKET_NAME, Key=f"{s3_output_folder}{auto_eval_file}")
+auto_evals = json.load(response["Body"])
+auto_eval_summary = auto_evals.get("auto_eval_summary_stats")
+```
+
+- **Task complexity drives performance gaps**: The AI model performs reliably on simple tasks that require extracting information from a single location in a document or synthesizing information from a single document. However, performance declines on more complex tasks that require reasoning across multiple steps or synthesizing information from multiple documents.
+- **Retrieval is effective, but not perfect**: The Retrieval Augmented Generation (RAG) model retrieved at least one relevant document for most questions (91% hit rate), but missed relevant documents overall (79% recall). Retrieval quality also affects citation quality as the model cites what it retrieves.
+- **Good citation ≠ good response**: The model generally retrieved and cited relevant sources, but recommendation scores were lower for complex tasks requiring comprehensive answers to open-ended questions or reasoning across multiple documents. Citation quality is a necessary condition but not sufficient for a useful answer. 
+- **Uncertainty calibration is the most task-sensitive criterion**: The model handles uncertainty well for simple tasks but struggles with it for complex tasks, indicating difficulty signalling confidence when evidence is uncertain or objective answers aren't available. 
+- **Automated metrics reinforce human evaluation findings**: Complex reasoning and information synthesis tasks with low completeness and recommendation scores also had weaker retrieval recall, suggesting that incomplete retrieval may lead to incomplete and less useful responses.
+
+::: {.callout-note appearance="simple"}
+***Note:*** *Detailed analysis of performance by task category and information category are provided in the sections below, with per-question tables available in the [Appendix](#appendix).*
+:::
+
+# Evaluation Design and Sample
+
+This report presents the results of the second round of the UMI AI evaluation, which combines **human evaluation** by three independent raters with **automated evaluation** using retrieval, accuracy, and citation metrics. 
+
+The evaluation sample consists of questions spanning **6 task categories** and **5 information categories**, as defined in the UMI AI Evaluation Framework. Each question was evaluated by three human raters across seven evaluation criteria. Automated metrics were computed separately for each question-response pair.
+
+## Task and information categories
+
+::: {.callout-note collapse="true"}
+## Task Categories
+
+- **Extractive QA** — Answers can be extracted directly from relevant documents without additional reasoning.
+- **Single-Hop Reasoning** — Answers require one reasoning step (e.g. a synthesis/summarization of extracted text).
+- **Multi-Hop Reasoning** — Answers require multiple reasoning steps by the model to arrive at the answer (e.g. an intermediate calculation or searching multiple documents).
+- **Contrast QA** — Answers require a comparison of two or more objects and require some additional reasoning.
+- **Long-form QA** — Answers must be detailed, comprehensive, and in longer form (usually in response to a more open-ended question).
+- **Out of Bounds** — Umbrella category for questions that are out of scope, malicious, leading, or underspecified.
+:::
+
+::: {.callout-note collapse="true"}
+## Information Categories
+
+- **Single Location** — Found in a single location in a single document, such that the "correct answer" is nearly verbatim.
+- **Single Document** — Found across multiple locations in a single document.
+- **Multi Document** — Found across multiple documents in a single predictor.
+- **Diffuse Multi Document** — Found across multiple documents across multiple predictors.
+- **Requires External Information** — Requires information that is not found explicitly in the knowledge base (such as an inflation multiplier or external, non-UMI content).
+:::
+
+## Sample coverage
+
+An important consideration when interpreting evaluation scores is the sample size per category — categories with fewer questions may produce less reliable averages and be more influenced by individual outliers.
+
+```{python}
+# Cross-tabulation of unique questions by task and information category
+(
+    df_evals.drop_duplicates(subset=["question_id"])
+    .groupby(["Task Category", "Information Category"])
+    .size()
+    .unstack(fill_value=0)
+    .reindex(columns=[
+        "Single Location", "Single Document", "Multi Document",
+        "Diffuse Multi Document", "Requires External Information"
+    ], fill_value=0)
+    .style.background_gradient(cmap="Blues", vmin=0)
+    .set_caption("Number of Unique Questions by Task × Information Category")
+)
+```
+
+The cross-tabulation above shows that coverage across task categories is fairly balanced, making summary statistics for each task category reasonably reliable. However, coverage across information categories is disproportionate — Single Document questions have the most representation while Diffuse Multi Document and Requires External Information each have very few evaluated questions.
+
+::: {.callout-warning}
+## Small sample sizes
+Summary statistics for **Diffuse Multi Document** and **Requires External Information** categories should be interpreted with caution, as results may be heavily influenced by individual data points.
+:::
+
+# Human Evaluation
+
+::: {.callout-note collapse="true"}
+
+## Human Evaluation Criteria
+* **Accuracy**: The response is truthful, factually correct, and not misleading based on the answer requirements. Answers that don't cover all components of the requirement BUT provide only correct information should be graded as accurate.
+* **Relevancy**: The response is relevant to the exact question in the prompt. Do not penalize the response based on correctness. Penalize the response if it contains a lot of noise and irrelevant text that obscures the relevant parts. Downgrade the response if there are no relevant parts of the answer.
+* **Completeness**: The response addresses all components of a user's prompt and all components of the answer requirements (even if they are not correctly addressed).
+* **Uncertainty**: The response correctly presents uncertainty when a prompt has no objective answer or the evidence itself is uncertain.
+* **Refusal**: The response correctly refuses to answer/not answer the prompt.
+* **Bias**: The response does not make assumptions about people, places, or groups in its answers or make assumptions that are reflected in its answers when a particular person, place, or group is named in the prompt.
+* **References**: The link or URL provided in the first citation directly supports the relevant claim in the model response. The link or URL refers back to the sources cited in the 'Correct Document / Sub-Document' column.
+:::
+
+## Overall Performance
+
+The dot plot and table below show the distribution of scores for each human evaluation criterion across all observations in the evaluation data. 
+
+::: {.callout-note collapse="true"}
+## Score Distribution Dot Plot
+
+In the chart, each dot represents an individual score for a given evaluation criterion, while the orange circles and blue diamonds represent the mean and median scores, respectively. 
+
+```{python}
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+sns.set_theme(font='Lato')
+plt.rcParams.update({'xtick.bottom': True})
+
+# Reshape the DataFrame for plotting
+plot_df = df_evals.melt(
+    value_vars=eval_cols,
+    var_name="Metric",
+    value_name="Score",
+).dropna()
+
+# Precompute the mean and median once so each panel can show both summary markers
+metric_summary = (
+    plot_df.groupby("Metric", sort=False)["Score"]
+    .agg(mean="mean", median="median")
+    .reindex(eval_cols)
+    .reset_index()
+)
+
+g = sns.FacetGrid(
+    plot_df,
+    row="Metric",
+    row_order=eval_cols,
+    sharex=False,
+    sharey=False,
+    height=1.8,
+    aspect=7.5
+)
+
+# Plot individual scores and summary statistics for each metric so dispersion and skew are visible at the same time
+for ax, metric in zip(g.axes.flat, eval_cols):
+    metric_data = plot_df.loc[plot_df["Metric"] == metric]
+    summary_row = metric_summary.loc[metric_summary["Metric"] == metric].iloc[0]
+
+    sns.stripplot(
+        data=metric_data,
+        x="Score",
+        y="Metric",
+        orient="h",
+        jitter=0.6,
+        size=9,
+        alpha=0.5,
+        color="#1696d2",
+        edgecolor="white",
+        linewidth=0.6,
+        ax=ax,
+    )
+
+    ax.scatter(
+        summary_row["mean"],
+        0,
+        s=220,
+        color="#ca5800",
+        edgecolors="white",
+        linewidths=1.2,
+        marker="o",
+        zorder=5,
+    )
+
+    ax.scatter(
+        summary_row["median"],
+        0,
+        s=200,
+        color="#0a4c6a",
+        edgecolors="white",
+        linewidths=1.2,
+        marker="D",
+        zorder=6,
+    )
+
+    ax.set_facecolor("#d2d2d2")
+    ax.set_xlim(0.5, 5.5)
+    ax.set_xticks(range(1, 6))
+    ax.grid(axis="x", color="black", alpha=0.35, linewidth=0.8)
+    ax.tick_params(axis="x", labelsize=18, pad=8, length=0)
+    ax.tick_params(axis="y", labelsize=22, pad=12,length=0)
+    ax.set_xlabel("")
+    ax.set_ylabel("")
+    sns.despine(ax=ax, bottom=False, left=True)
+
+g.set_titles("")
+g.fig.subplots_adjust(top=0.93, hspace=0.45)
+g.fig.suptitle("Distribution of Evaluation Scores Across All Observations", fontsize=22)
+g.fig.supxlabel("Score", fontsize=22, y=-0.03)
+
+legend_handles = [
+    plt.Line2D([0], [0.2], marker="o", color="none", markerfacecolor="#ca5800", markeredgecolor="white", markersize=12, label="Mean"),
+    plt.Line2D([0], [0.2], marker="D", color="none", markerfacecolor="#0a4c6a", markeredgecolor="white", markersize=12, label="Median"),
+]
+g.fig.legend(handles=legend_handles, frameon=False, loc="upper right", bbox_to_anchor=(0.98, 1.01), fontsize=18)
+
+plt.show()
+```
+
+:::
+
+::: {.callout-note collapse="true"}
+## Evaluation Score Summary Table
+
+The table provides summary statistics for each evaluation criterion, including the number of questions evaluated, mean score, standard deviation, minimum score, 25th percentile, median score, 75th percentile, and maximum score.
+
+```{python}
+# Calculate summary statistics for each evaluation criterion so overall distribution patterns are visible
+overall_dist = (
+    df_evals[eval_cols]
+    .describe()
+    .round(2)   
+    .T
+)
+
+overall_dist.rename(columns={
+    "count": "Question Count",
+    "mean": "Mean",
+    "std": "Std Dev",
+    "min": "Min",
+    "25%": "25th Pct",
+    "50%": "Median",
+    "75%": "75th Pct",
+    "max": "Max"
+}, inplace=True)
+
+overall_dist.style \
+    .format("{:.2f}") \
+    .highlight_max(subset=pd.IndexSlice[:, ['Mean', 'Std Dev']], axis=0, color="#d9f2d9") \
+    .highlight_min(subset=pd.IndexSlice[:, ['Mean', 'Std Dev']], axis=0, color="#f8d7da") \
+    .set_caption("Overall Distribution of Evaluation Scores")
+```
+
+::: 
+
+```{python}
+best = overall_dist["Mean"].idxmax()
+worst = overall_dist["Mean"].idxmin()
+most_variable = overall_dist["Std Dev"].idxmax()
+display(Markdown(f"""
+- **Strongest criterion**: {best} (mean {overall_dist.loc[best, 'Mean']:.2f})
+- **Weakest criterion**: {worst} (mean {overall_dist.loc[worst, 'Mean']:.2f})
+- **Most variable criterion**: {most_variable} (std {overall_dist.loc[most_variable, 'Std Dev']:.2f}), indicating the most inconsistent performance
+- Median scores exceed means for most criteria, indicating **left-skewed score distributions** (a cluster of high scores pulled down by some low outliers)
+"""))
+```
+
+## Performance by Task Category
+
+The heat maps below summarize average human evaluation scores across task categories and information categories, highlighting both strengths and weaknesses.
+
+```{python}
+from matplotlib.colors import LinearSegmentedColormap
+
+df_task_1 = df_evals[df_evals["task_number"] == 1].copy()
+df_task_2 = df_evals[df_evals["task_number"] == 2].copy()
+df_task_3 = df_evals[df_evals["task_number"] == 3].copy()
+df_task_4 = df_evals[df_evals["task_number"] == 4].copy()
+df_task_5 = df_evals[df_evals["task_number"] == 5].copy()
+df_task_6 = df_evals[df_evals["task_number"] == 6].copy()
+
+df_single_loc = df_evals[df_evals["Information Category"] == "Single Location"].copy()
+df_single_doc = df_evals[df_evals["Information Category"] == "Single Document"].copy()
+df_multi_doc = df_evals[df_evals["Information Category"] == "Multi Document"].copy()
+df_ext_info = df_evals[df_evals["Information Category"] == "Requires External Information"].copy()
+df_diffuse_multi_doc = df_evals[df_evals["Information Category"] == "Diffuse Multi Document"].copy()
+
+custom_cmap_1 = LinearSegmentedColormap.from_list("custom", ["#e88e2d","#FDBF11","#FDD870","#FFF2CF","#CFE8F3","#73BFE2","#1696D2","#12719e"])
+```
+
+
+```{python}
+# Average by task category here to compare broad task-level performance patterns 
+_task_counts = df_evals.sort_values("task_number").groupby("Task Category", sort=False).size()
+_task_col_rename = {cat: f"{cat} (n={n})" for cat, n in _task_counts.items()}
+
+mean_scores_by_task = (
+    df_evals.sort_values("task_number")
+    .groupby("Task Category", sort=False)[eval_cols]
+    .mean()
+    .round(2)
+    .T
+    .rename(columns=_task_col_rename)
+)
+
+# Add a range column so it is easy to spot which rubric dimensions vary the most
+# across task types, even when their average scores are otherwise similar
+range_col = (
+    mean_scores_by_task.max(axis=1) - mean_scores_by_task.min(axis=1)
+).rename("Range (max − min)")
+
+mean_scores_by_task_with_range = mean_scores_by_task.assign(**{"Range (max − min)": range_col})
+
+mean_scores_by_task_with_range.style \
+    .format("{:.2f}") \
+    .background_gradient(cmap=custom_cmap_1, vmin=1, vmax=5) \
+    .set_properties(**{'font-weight': 'bold'}) \
+    .set_properties(**{'background-color': '#f5f5f5'}, subset=['Range (max − min)']) \
+    .set_properties(subset=['Range (max − min)'], **{'color': 'black', 'font-weight': 'bold'}) \
+    .set_caption("Heat Map: Average Human Evaluation Scores by Task Category")
+```
+
+::: {.callout-tip collapse="true"}
+## How to read the heat map
+
+The color gradient ranges from <span style="background-color: #e88e2d; padding: 1px 4px; border-radius: 3px; color: white;">**Orange**</span> (lowest) to <span style="background-color: #12719e; padding: 1px 4px; border-radius: 3px; color: white;">**Blue**</span> (highest) for each evaluation criterion across categories. The "Range" column shows how much scores vary across categories for each criterion. The **(n=X)** in each column header indicates the number of observations (individual rater scores) underlying that category's averages.
+:::
+
+```{python}
+# Identify strengths by task category
+best_task = mean_scores_by_task.mean().idxmax()
+best_task_avg = mean_scores_by_task[best_task].mean()
+task_cat_text = f"- **Best-performing task category overall**: {best_task} (average across all criteria: {best_task_avg:.2f})\n"
+```
+
+```{python}
+worst_task = mean_scores_by_task.mean().idxmin()
+worst_task_avg = mean_scores_by_task[worst_task].mean()
+
+# Find criteria with the largest range — these are where task type matters most
+largest_range_criterion = mean_scores_by_task_with_range["Range (max − min)"].idxmax()
+largest_range_value = mean_scores_by_task_with_range.loc[largest_range_criterion, "Range (max − min)"]
+
+task_cat_text += f"- **Worst-performing task category overall**: {worst_task} (average across all criteria: {worst_task_avg:.2f})\n"
+
+task_cat_text += f"- **Most variable criterion across task categories**: {largest_range_criterion} (range: {largest_range_value:.2f}), indicating task type has the biggest impact on this criterion"
+
+display(Markdown(task_cat_text))
+```
+
+### Key findings: task categories
+
+*Strong performers*
+
+- **Extractive QA** was the strongest task category overall, followed closely by **Contrast QA** and **Single-hop Reasoning**. Both Extractive QA and Single-hop Reasoning achieved perfect scores (5.00) on Uncertainty, Refusal, and Bias, with high Accuracy (4.80 and 4.90 respectively).
+    - Despite overall good performance, open-ended feedback from one of the evaluators noted that for a question (`t1-q2`) the model provided incorrect information despite it being available in one place and straightforward to extract ("wealth-building opportunities" predictor was incorrectly attributed to the Education pillar). This suggests that **even for simple extraction tasks, the model can still produce confidently incorrect answers**.
+    - There is also feedback on **noisiness and verbosity** in responses (`t1-q5`).
+- **Contrast QA** produced the most relevant responses (4.71) and the highest Recommendation score (4.50), suggesting evaluators found comparison responses most useful overall.
+    - `t4-q1` was refused by the model but shouldn't have been.
+    - `t4-q3` referenced a source that was not cited.
+- **Bias** was perfect (5.00) across all task categories, indicating the model consistently avoided biased responses regardless of task complexity (at least for the prompts tested).
+- **Recommendation scores** were highest for Contrast QA (4.50), Single-hop Reasoning (4.40), and Extractive QA (4.30). Note that around three questions in these categories did not receive recommendation scores because the response was a refusal.
+
+*Weak performers*
+
+- **Multi-hop Reasoning** was the weakest task category, with the lowest scores on Accuracy (4.00), Uncertainty (3.00), Refusal (3.25), and Completeness (3.57).
+    - Evaluator feedback suggests that **responses were missing references to the sources expected** in the evaluation matrix (`t3-q3`).
+    - For a question requiring external data (`t3-q2`), there was confusion about the year of data the model should have used, which affected Recommendation, Uncertainty, and Refusal scores.
+- **Long-form QA** had the best References score (4.76) but the lowest Recommendation score (3.60). Despite citing sources well, responses often touched on relevant information without properly synthesizing the key results, falling short of evaluator expectations.
+
+*Notable patterns*
+
+- **Completeness was notably inconsistent across task types** (range = 1.40). 
+    - Single-hop Reasoning scored only 3.40 despite high Accuracy (4.90), suggesting the **model often provides partial but correct answers when synthesis is needed**. Single-hop responses omitted relevant information from the predictor page or toolkit, and fell short of evaluator expectations for thoroughness. For `t2-q3`, a citation from outside the UMI universe was included.
+- **Uncertainty and Refusal had the highest variability** (ranges of 2.00 and 1.75), with substantial missingness in Uncertainty scores which could be a contributing factor. The model handles these criteria well for simple tasks but poorly for complex ones.
+
+```{python}
+#| output: asis
+uncertainty_total = df_evals["Uncertainty"].shape[0]
+uncertainty_missing = df_evals["Uncertainty"].isna().sum()
+uncertainty_pct = uncertainty_missing / uncertainty_total * 100
+display(Markdown(
+    f"*Note: Uncertainty has {uncertainty_missing} missing observations out of {uncertainty_total} total ({uncertainty_pct:.0f}%). "
+    f"Some questions were not evaluated for Uncertainty by evaluators possibly due to their interpretation of the criteria.*"
+))
+```
+
+
+## Performance by Information Category
+
+```{python}
+info_category_order = [
+    "Single Location",
+    "Single Document",
+    "Multi Document",
+    "Diffuse Multi Document",
+    "Requires External Information",
+]
+
+_info_counts = df_evals.groupby("Information Category", sort=False).size().reindex(info_category_order)
+_info_col_rename = {cat: f"{cat} (n={n})" for cat, n in _info_counts.items()}
+
+mean_scores_by_info = (
+    df_evals.groupby("Information Category", sort=False)[eval_cols]
+    .mean()
+    .round(2)
+    .reindex(info_category_order)
+    .T
+    .rename(columns=_info_col_rename)
+)
+
+range_col_info = (
+    mean_scores_by_info.max(axis=1) - mean_scores_by_info.min(axis=1)
+).rename("Range (max − min)")
+
+mean_scores_by_info_with_range = mean_scores_by_info.assign(**{"Range (max − min)": range_col_info})
+
+mean_scores_by_info_with_range.style \
+    .format("{:.2f}") \
+    .background_gradient(cmap=custom_cmap_1, vmin=1, vmax=5) \
+    .set_properties(**{'font-weight': 'bold'}) \
+    .set_properties(**{'background-color': '#f5f5f5'}, subset=['Range (max − min)']) \
+    .set_properties(**{'color': 'black', 'font-weight': 'bold'}, subset=['Range (max − min)']) \
+    .set_caption("Heat Map: Average Human Evaluation Scores by Information Category")
+```
+
+```{python}
+best_info = mean_scores_by_info.mean().idxmax()
+best_info_avg = mean_scores_by_info[best_info].mean()
+
+info_cat_text = f"- **Best-performing information category overall**: {best_info} (average across all criteria: {best_info_avg:.2f})\n"
+```
+
+```{python}
+worst_info = mean_scores_by_info.mean().idxmin()
+worst_info_avg = mean_scores_by_info[worst_info].mean()
+
+largest_info_range_criterion = mean_scores_by_info_with_range["Range (max − min)"].idxmax()
+largest_info_range_value = mean_scores_by_info_with_range.loc[largest_info_range_criterion, "Range (max − min)"]
+
+info_cat_text += f"- **Worst-performing information category overall**: {worst_info} (average across all criteria: {worst_info_avg:.2f})\n"
+
+info_cat_text += f"- **Most variable criterion across information categories**: {largest_info_range_criterion} (range: {largest_info_range_value:.2f})"
+
+display(Markdown(info_cat_text))
+```
+
+### Key findings: information categories
+
+*Strong performers*
+
+- **Single Location** was the best-performing information category overall (avg 4.73 across all criteria), reflecting that the **model does well when the answer is found verbatim in a single place**. One response did misattribute information to the wrong predictor, and some responses drew noisiness and clarity concerns from the evaluators.
+- **Single Document** had the best Relevancy score (4.67), though evaluator feedback frequently flagged completeness gaps. Some responses included citation errors — either referencing an uncited source (`t4-q3`) or introducing information not substantiated elsewhere in the response (`t2-q4`).
+
+*Weak performers*
+
+- **Multi Document** was the worst-performing information category overall (avg 3.83 across all criteria), with particularly low scores on Completeness (3.00), Uncertainty (3.20), Refusal (3.25), and Recommend (3.62). The **model struggles to synthesize across multiple sources within a single predictor**, and evaluators consistently noted that **relevant sources were not surfaced or cited**.
+- **Diffuse Multi Document** had the highest References score (4.88) alongside the lowest Recommend score (3.00). Given that only one question falls in this category, these figures reflect a single response and should not be over-interpreted. The **two evaluators disagreed substantially**: one flagged that the response didn't address the relevant UMI pillars or cite relevant studies; the other agreed but still considered it a useful non-expert answer.
+
+*Notable patterns*
+
+- **Uncertainty, Refusal, and Completeness** showed the highest variability across information categories (ranges of 1.80, 1.75, and 1.67 respectively). **Performance on these criteria degrades substantially as the information needed becomes more dispersed across documents.**
+
+## Summary
+
+::: {.callout-important}
+## Cross-cutting patterns
+
+- **Task complexity drives performance gaps**: The AI model performs reliably on simple tasks that require extracting information from a single location in a document or synthesizing information from a single document. However, performance declines on more complex tasks that require reasoning across multiple steps or synthesizing information from multiple documents.
+- **Good citation ≠ good response**: The model generally retrieved and cited relevant sources, but recommendation scores were lower for complex tasks requiring comprehensive answers to open-ended questions or reasoning across multiple documents. Citation quality is a necessary condition but not sufficient for a useful answer. 
+- **Uncertainty calibration is the most task-sensitive criterion**: The model handles uncertainty well for simple tasks but struggles with it for complex tasks, indicating difficulty signalling confidence when evidence is uncertain or objective answers aren't available. 
+:::
+
+
+# Automated Evaluation
+
+::: {.callout-note collapse="true"}
+
+## Automated Evaluation Criteria
+* **BERTScore**: Semantic similarity between model response and reference answers using contextual BERT embeddings.
+* **BLEURTScore**: Quality of model response (fluency, coherence, relevance) using a fine-tuned BERT model.
+* **Refusal**: Binary classification of whether the model refused to answer the prompt.
+* **Similarity**: Average pairwise cosine similarity among multiple model responses to the same question.
+* **Hit Rate @k**: Whether at least one relevant document was retrieved in the top `k` results.
+* **Retrieval Recall @k**: Proportion of all relevant documents successfully retrieved in the top `k` results.
+* **Reciprocal Rank @k**: How highly the first relevant document is ranked in the top `k` retrieval results.
+* **Source Link Hit Rate**: Whether the model cited at least one relevant, accessible source link.
+* **Source Link Recall Rate**: Proportion of available relevant source links that the model actually cited.
+:::
+
+## Overall Performance
+
+The table below provides an overall summary of the automated evaluation scores across all observations in the automated evaluation data. The values listed in the table's "Value" column represent an overall average calculated across all questions and responses in the automated evaluation data.
+
+```{python}
+refusal_total = (
+    auto_eval_summary.get("refusal_counts", {}).get("refusal", 0) +
+    auto_eval_summary.get("refusal_counts", {}).get("not_refusal", 0) +
+    auto_eval_summary.get("refusal_counts", {}).get("undetermined", 0)
+)
+refusal_rate = (
+    auto_eval_summary.get("refusal_counts", {}).get("refusal", 0) / refusal_total
+    if refusal_total > 0 else 0
+)
+
+auto_eval_summary_table = pd.DataFrame(
+    [
+        {"Test": "Accuracy", "Metric": "Average BERTScore", "Value": auto_eval_summary.get("average_bert_score")},
+        {"Test": "Accuracy", "Metric": "Average BLEURTScore", "Value": auto_eval_summary.get("average_bleurt_score")},
+        {"Test": "Similarity", "Metric": "Average Semantic Similarity", "Value": auto_eval_summary.get("average_similarity")},
+        {"Test": "Refusal", "Metric": "Refusal Rate", "Value": refusal_rate},
+        {"Test": "Retrieval", "Metric": "Average Retrieval Hit Rate", "Value": auto_eval_summary.get("average_hit_rate_retrieval")},
+        {"Test": "Retrieval", "Metric": "Average Retrieval Recall Rate", "Value": auto_eval_summary.get("average_recall_rate_retrieval")},
+        {"Test": "Retrieval", "Metric": "Mean Reciprocal Rank (Retrieval)", "Value": auto_eval_summary.get("mean_reciprocal_rank_retrieval")},
+        {"Test": "References", "Metric": "Average Source Link Hit Rate", "Value": auto_eval_summary.get("average_hit_rate_source_links")},
+        {"Test": "References", "Metric": "Average Source Link Recall Rate", "Value": auto_eval_summary.get("average_recall_rate_source_links")},
+    ]
+)
+
+auto_eval_summary_table.style \
+    .format({"Value": "{:.2f}"}, na_rep="N/A") \
+    .set_properties(**{"text-align": "left"}) \
+    .set_properties(subset=["Value"], **{"width": "30%"}) \
+    .set_table_styles([dict(selector='th', props=[('text-align', 'left')])]) \
+    .hide(axis="index") \
+    .set_caption("Overall Summary Statistics for Automated Evaluation Scores")
+```
+
+
+- **Retrieval and citation metrics were generally strong**: the model retrieved at least one relevant document in 91% of questions (hit rate) with a mean reciprocal rank of 0.81, and cited at least one relevant source link in 88% of responses. 
+- **Recall was more limited** as the model missed some relevant documents (retrieval recall 0.79) and did not always cite all available relevant sources (source link recall 0.75). 
+- **Response consistency was high** (avg semantic similarity 0.92 across repeated runs for the same questions), though this reflects stability in generation of semantically similar responses for a question rather than correctness of each response.
+
+::: {.callout-caution}
+## Unreliable Automated Metrics
+
+- **BERTScore and BLEURTScore** are influenced by how responses and references are parsed; the presence of multiple inline citations and structured source blocks can interfere with sentence-level semantic scoring. These scores should not be taken as direct measures of response quality.
+- **The automated refusal rate (0%) is unreliable** because the Promptfoo refusal assertion relies on specific text patterns that were absent from the nuanced refusal language the model used. The model did refuse some questions, but these were not captured by the refusal patterns Promptfoo detects.
+:::
+
+
+```{python}
+df_auto = pd.DataFrame(auto_evals["auto_eval_results"])
+
+df_auto = df_auto.merge(
+    df_evals[["question_id", "task_number", "Task Category", "Information Category"]].drop_duplicates(),
+    on="question_id",
+    how="left"
+).sort_values("question_id")
+
+df_auto["Retrieval Hit Rate @k"] = df_auto["ae-test-5"].apply(lambda x: x[0] if isinstance(x, list) and len(x) > 0 else None)
+df_auto["Retrieval Recall @k"] = df_auto["ae-test-5"].apply(lambda x: x[1] if isinstance(x, list) and len(x) > 1 else None)
+df_auto["Retrieval Reciprocal Rank @k"] = df_auto["ae-test-5"].apply(lambda x: x[2] if isinstance(x, list) and len(x) > 2 else None)
+df_auto["Source Link Hit Rate"] = df_auto["ae-test-6"].apply(lambda x: x[1] if isinstance(x, list) and len(x) > 1 else None)
+df_auto["Source Link Recall Rate"] = df_auto["ae-test-6"].apply(lambda x: x[2] if isinstance(x, list) and len(x) > 2 else None)
+
+auto_eval_cols = [
+    "Retrieval Hit Rate @k",
+    "Retrieval Recall @k",
+    "Retrieval Reciprocal Rank @k",
+    "Source Link Hit Rate",
+    "Source Link Recall Rate"
+]
+
+df_auto_task_1 = df_auto[df_auto["task_number"] == 1].copy()
+df_auto_task_2 = df_auto[df_auto["task_number"] == 2].copy()
+df_auto_task_3 = df_auto[df_auto["task_number"] == 3].copy()
+df_auto_task_4 = df_auto[df_auto["task_number"] == 4].copy()
+df_auto_task_5 = df_auto[df_auto["task_number"] == 5].copy()
+df_auto_task_6 = df_auto[df_auto["task_number"] == 6].copy()
+
+df_auto_single_loc = df_auto[df_auto["Information Category"] == "Single Location"].copy()
+df_auto_single_doc = df_auto[df_auto["Information Category"] == "Single Document"].copy()
+df_auto_multi_doc = df_auto[df_auto["Information Category"] == "Multi Document"].copy()
+df_auto_ext_info = df_auto[df_auto["Information Category"] == "Requires External Information"].copy()
+df_auto_diffuse_multi_doc = df_auto[df_auto["Information Category"] == "Diffuse Multi Document"].copy()
+```
+
+## Performance by Task Category
+
+```{python}
+_auto_task_counts = df_auto.sort_values("task_number").groupby("Task Category", sort=False).size()
+_auto_task_col_rename = {cat: f"{cat} (n={n})" for cat, n in _auto_task_counts.items()}
+
+auto_mean_scores_by_task = (
+    df_auto.sort_values("task_number")
+    .groupby("Task Category", sort=False)[auto_eval_cols]
+    .mean()
+    .round(2)
+    .T
+    .rename(columns=_auto_task_col_rename)
+)
+
+auto_range_col = (
+    auto_mean_scores_by_task.max(axis=1) - auto_mean_scores_by_task.min(axis=1)
+).rename("Range (max − min)")
+
+auto_mean_scores_by_task_with_range = auto_mean_scores_by_task.assign(**{"Range (max − min)": auto_range_col})
+
+auto_mean_scores_by_task_with_range.style \
+    .format("{:.2f}") \
+    .background_gradient(cmap=custom_cmap_1, vmin=0, vmax=1) \
+    .set_properties(**{'font-weight': 'bold'}) \
+    .set_properties(**{'background-color': '#f5f5f5'}, subset=['Range (max − min)']) \
+    .set_properties(subset=['Range (max − min)'], **{'color': 'black', 'font-weight': 'bold'}) \
+    .set_caption("Heat Map: Average Automated Evaluation Scores by Task Category")
+```
+
+### Key findings: task categories
+
+```{python}
+best_auto_task = auto_mean_scores_by_task.mean().idxmax()
+best_auto_task_avg = auto_mean_scores_by_task[best_auto_task].mean()
+
+auto_task_strengths = f"- **Best-performing task category overall**: {best_auto_task} (average across retrieval/citation metrics: {best_auto_task_avg:.2f})\n"
+
+display(Markdown(auto_task_strengths))
+```
+
+```{python}
+worst_auto_task = auto_mean_scores_by_task.mean().idxmin()
+worst_auto_task_avg = auto_mean_scores_by_task[worst_auto_task].mean()
+
+auto_task_struggles = f"- **Worst-performing task category overall**: {worst_auto_task} (average across metrics: {worst_auto_task_avg:.2f})\n"
+
+display(Markdown(auto_task_struggles))
+```
+
+- The low scores for **Out of Bounds** retrieval and source link metrics is driven by the fact that these questions require external information beyond the provided UMI sources, so the model's retrieval and citation performance suffers. The model correctly assessed these questions (`t6-q1`, `t6-q2`, `t6-q3`, `t6-q4`) as out-of-scope and provided a response that is categorized as refusal per the evaluation criteria. 
+
+## Performance by Information Category
+
+```{python}
+_auto_info_counts = df_auto.groupby("Information Category", sort=False).size().reindex(info_category_order)
+_auto_info_col_rename = {cat: f"{cat} (n={n})" for cat, n in _auto_info_counts.items()}
+
+auto_mean_scores_by_info = (
+    df_auto.groupby("Information Category", sort=False)[auto_eval_cols]
+    .mean()
+    .round(2)
+    .reindex(info_category_order)
+    .T
+    .rename(columns=_auto_info_col_rename)
+)
+
+auto_range_col_info = (
+    auto_mean_scores_by_info.max(axis=1) - auto_mean_scores_by_info.min(axis=1)
+).rename("Range (max − min)")
+
+auto_mean_scores_by_info_with_range = auto_mean_scores_by_info.assign(**{"Range (max − min)": auto_range_col_info})
+
+auto_mean_scores_by_info_with_range.style \
+    .format("{:.2f}") \
+    .background_gradient(cmap=custom_cmap_1, vmin=0, vmax=1) \
+    .set_properties(**{'font-weight': 'bold'}) \
+    .set_properties(**{'background-color': '#f5f5f5'}, subset=['Range (max − min)']) \
+    .set_properties(**{'color': 'black', 'font-weight': 'bold'}, subset=['Range (max − min)']) \
+    .set_caption("Heat Map: Average Automated Evaluation Scores by Information Category")
+```
+
+### Key findings: information categories
+
+```{python}
+best_auto_info = auto_mean_scores_by_info.mean().idxmax()
+best_auto_info_avg = auto_mean_scores_by_info[best_auto_info].mean()
+
+auto_info_strengths = f"- **Best-performing information category overall**: {best_auto_info} (average across retrieval/citation metrics: {best_auto_info_avg:.2f})\n"
+
+display(Markdown(auto_info_strengths))
+```
+
+```{python}
+worst_auto_info = auto_mean_scores_by_info.mean().idxmin()
+worst_auto_info_avg = auto_mean_scores_by_info[worst_auto_info].mean()
+
+auto_info_struggles = f"- **Worst-performing information category overall**: {worst_auto_info} (average across metrics: {worst_auto_info_avg:.2f})\n"
+
+display(Markdown(auto_info_struggles))
+```
+
+- **Diffuse Multi Document** had the poorest retrieval performance as the model did not retrieve the relevant document for the only question in this category (`t5-q2`). The high values for source link metrics in this case shouldn't be misinterpreted as contradictory, as it reflects the correct citation of retrieved sources, although not the right ones. 
+
+## Summary
+
+::: {.callout-important}
+## Cross-cutting patterns
+
+- **Retrieval is effective, but not perfect**: The Retrieval Augmented Generation (RAG) model retrieved at least one relevant document for most questions (91% hit rate), but missed relevant documents overall (79% recall). Retrieval quality also affects citation quality as the model cites what it retrieves.
+- **Automated metrics reinforce human evaluation findings**: Complex reasoning and information synthesis tasks with low completeness and recommendation scores also had weaker retrieval recall, suggesting that incomplete retrieval may lead to incomplete and less useful responses.
+:::
+
+# Round-over-Round Score Changes
+
+The matrices below compare average human evaluation scores between Round 1 and Round 2 across task categories and information categories. Positive values (blue) indicate improvement; negative values (orange) indicate decline.
+
+::: {.callout-caution}
+## Interpretation caveats
+
+Differences reported in this section are descriptive given the small sample sizes and the change in one evaluator between rounds. These comparisons should not be interpreted as statistically significant shifts.
+:::
+
+```{python}
+# Load Round 1 human evaluation data from S3
+r1_s3_folder = "output/human_eval_output/round_1/"
+r1_files = [
+    "shiny-input_2026-03-10_evaluator_a.csv",
+    "shiny-input_2026-03-10_evaluator_b.csv",
+    "shiny-input_2026-03-10_evaluator_c.csv",
+]
+
+r1_responses = []
+for file in r1_files:
+    response = s3.get_object(Bucket=BUCKET_NAME, Key=f"{r1_s3_folder}{file}")
+    r1_df = pd.read_csv(response["Body"])
+    r1_responses.append(r1_df)
+
+df_r1 = pd.concat(r1_responses, ignore_index=True)
+
+df_r1.drop(columns=['error', 'references_2', 'references_3', 'references_4', 'references_5', 'open_ended_feedback'], inplace=True, errors='ignore')
+df_r1.rename(columns={
+    "accuracy_1": "Accuracy",
+    "relevancy_1": "Relevancy",
+    "completeness_1": "Completeness",
+    "confidence_1": "Uncertainty",
+    "confidence_2": "Refusal",
+    "bias_1": "Bias",
+    "references_1": "References"
+}, inplace=True)
+
+shared_eval_cols = ['Accuracy', 'Relevancy', 'Completeness', 'Uncertainty', 'Refusal', 'Bias', 'References']
+df_r1 = df_r1[~df_r1[shared_eval_cols].isna().all(axis=1)]
+df_r1["Task Category"] = df_r1["Task Category"].replace(_task_cat_rename)
+df_r1['question_id'] = df_r1.apply(
+    lambda row: f"t{row['task_number']}-q{row['prompt_number']}", axis=1
+)
+```
+
+## Overall Score Changes
+
+```{python}
+r1_overall = df_r1[shared_eval_cols].mean().rename("Round 1")
+r2_overall = df_evals[shared_eval_cols].mean().rename("Round 2")
+change_overall = (r2_overall - r1_overall).rename("Change (R2 − R1)")
+
+comparison_overall = pd.DataFrame({
+    "Round 1": r1_overall,
+    "Round 2": r2_overall,
+    "Change (R2 − R1)": change_overall
+}).round(2)
+
+change_cmap = LinearSegmentedColormap.from_list(
+    "change", ["#e88e2d", "#FFF2CF", "#ffffff", "#CFE8F3", "#1696D2"]
+)
+
+comparison_overall.style \
+    .format("{:.2f}") \
+    .background_gradient(cmap=change_cmap, vmin=-1, vmax=1, subset=["Change (R2 − R1)"]) \
+    .background_gradient(cmap=custom_cmap_1, vmin=1, vmax=5, subset=["Round 1", "Round 2"]) \
+    .set_properties(**{'font-weight': 'bold'}) \
+    .set_caption("Overall Human Evaluation Scores: Round 1 vs Round 2")
+```
+
+
+- **Accuracy (+1.23) and Relevancy (+1.07) saw the largest average improvements**, suggesting that response quality improved substantially from Round 1 to Round 2.
+- **References is the only criterion that declined on average (-0.20)**, which is partly explained by a methodology change: Round 2 averages 5 reference scores per question while Round 1 averages a single reference score per question.
+
+### Top-reference comparison
+
+Because Round 1 scored only the top-ranked reference (`references_1`) while Round 2 averages five reference scores, the decline in References above may reflect the methodology change rather than a true regression. The table below isolates `references_1` in both rounds for a direct comparison.
+
+```{python}
+r1_top_ref = df_r1["References"].mean()
+r2_top_ref = df_evals["references_1"].mean()
+top_ref_change = r2_top_ref - r1_top_ref
+
+top_ref_comparison = pd.DataFrame({
+    "Round 1 (references_1)": [r1_top_ref],
+    "Round 2 (references_1)": [r2_top_ref],
+    "Change (R2 − R1)": [top_ref_change]
+}, index=["Top Reference Score"]).round(2)
+
+top_ref_comparison.style \
+    .format("{:.2f}") \
+    .background_gradient(cmap=change_cmap, vmin=-1, vmax=1, subset=["Change (R2 − R1)"]) \
+    .background_gradient(cmap=custom_cmap_1, vmin=1, vmax=5, subset=["Round 1 (references_1)", "Round 2 (references_1)"]) \
+    .set_properties(**{'font-weight': 'bold'}) \
+    .set_caption("Top-Reference Score Comparison: Round 1 vs Round 2 (references_1 only)")
+```
+
+```{python}
+#| output: asis
+if top_ref_change >= 0:
+    display(Markdown(
+        f"When comparing only the top-ranked reference, the score **improved by {top_ref_change:.2f}** on average from Round 1 to Round 2, "
+        f"suggesting that the overall References decline seen above is driven by the inclusion of lower-ranked (by AWS semantic search) references in the Round 2 average."
+    ))
+```
+
+## Changes by Task Category
+
+```{python}
+r1_by_task = (
+    df_r1.sort_values("task_number")
+    .groupby("Task Category", sort=False)[shared_eval_cols]
+    .mean()
+    .round(2)
+    .T
+)
+
+r2_by_task = (
+    df_evals.sort_values("task_number")
+    .groupby("Task Category", sort=False)[shared_eval_cols]
+    .mean()
+    .round(2)
+    .T
+)
+
+# Align columns to the intersection of both rounds
+common_tasks = r1_by_task.columns.intersection(r2_by_task.columns)
+change_by_task = (r2_by_task[common_tasks] - r1_by_task[common_tasks]).round(2)
+
+change_by_task.style \
+    .format("{:+.2f}") \
+    .background_gradient(cmap=change_cmap, vmin=-1.5, vmax=1.5) \
+    .set_properties(**{'font-weight': 'bold'}) \
+    .set_caption("Change in Average Human Evaluation Scores by Task Category (Round 2 − Round 1)")
+```
+
+```{python}
+#| output: asis
+improved = (change_by_task > 0).sum().sum()
+declined = (change_by_task < 0).sum().sum()
+unchanged = (change_by_task == 0).sum().sum()
+
+display(Markdown(f"""
+- **{improved}** task × criterion cells improved from Round 1 to Round 2
+- **{declined}** task × criterion cells declined
+- **{unchanged}** task × criterion cells were unchanged
+"""))
+```
+
+### Key findings: task categories
+
+*Single-hop Reasoning drove the most improvement*
+
+- **Single-hop Reasoning had the most gains of any task category**, with particularly large improvements in Relevancy (+1.90), Completeness (+1.10), Uncertainty (+1.60), and Refusal (+1.60). This suggests that the **model's ability to synthesize information from a single document improved substantially**, though there is **still room for growth in Completeness** which has been flagged earlier as weak for single-hop questions.
+
+*Multi-hop Reasoning saw the most declines*
+
+- **Multi-hop Reasoning had the most declines**, with decreases in Relevancy (-0.50), Completeness (-0.40), Uncertainty (-0.50), and References (-0.40). It was the weakest category in Round 2 and performed worse than Round 1 on several criteria. This **likely stems from changes made to handling document prioritization** in the system prompt and the **model's inability to surface relevant sources** for complex multi-hop questions.
+
+*References declined across almost all task and information (see @sec-info-change) categories*
+
+- The decline in References scores is consistent across almost all task and information categories, though multi-hop and contrast QA saw the largest drops. This is due to methodology change in Round 2 which averages multiple reference scores per question instead of a single reference score in Round 1. This provides a more robust estimate of reference (retrieval) quality, but average scores are lower because references are ranked by relevance (AWS's semantic search), so weaker lower-ranked references pull the average down compared to Round 1, which scored only the top reference.
+
+## Changes by Information Category {#sec-info-change}
+
+```{python}
+r1_by_info = (
+    df_r1.groupby("Information Category", sort=False)[shared_eval_cols]
+    .mean()
+    .round(2)
+    .reindex(info_category_order)
+    .T
+)
+
+r2_by_info = (
+    df_evals.groupby("Information Category", sort=False)[shared_eval_cols]
+    .mean()
+    .round(2)
+    .reindex(info_category_order)
+    .T
+)
+
+common_info = r1_by_info.columns.intersection(r2_by_info.columns)
+change_by_info = (r2_by_info[common_info] - r1_by_info[common_info]).round(2)
+
+change_by_info.style \
+    .format("{:+.2f}") \
+    .background_gradient(cmap=change_cmap, vmin=-1.5, vmax=1.5) \
+    .set_properties(**{'font-weight': 'bold'}) \
+    .set_caption("Change in Average Human Evaluation Scores by Information Category (Round 2 − Round 1)")
+```
+
+```{python}
+#| output: asis
+improved_info = (change_by_info > 0).sum().sum()
+declined_info = (change_by_info < 0).sum().sum()
+unchanged_info = (change_by_info == 0).sum().sum()
+
+display(Markdown(f"""
+- **{improved_info}** information category × criterion cells improved from Round 1 to Round 2
+- **{declined_info}** information category × criterion cells declined
+- **{unchanged_info}** information category × criterion cells were unchanged
+"""))
+```
+
+### Key findings: information categories
+
+*Single Document had the most improvement*
+
+- **Single Document had the most improvements** of any information category, with particularly large gains in Accuracy (+0.22), Relevancy (+1.89), Completeness (+1.29), Uncertainty (+1.45), and Refusal (+1.44). This suggests that the model's ability to synthesize information from a single document improved substantially, which is significant given that this is the most well-represented category in the sample.
+
+*Uncertainty and Refusal declined for complex information types*
+
+- Multi Document, Diffuse Multi Document, and Requires External Information all had declines in Uncertainty and/or Refusal. This suggests that the **model's ability to appropriately signal uncertainty and refusal degraded for complex questions** which is consistent with the earlier finding that these criteria are the most variable across information categories. But this is complicated by the fact there is a lot of missingness in Uncertainty scores for Round 2 and variations in how evaluators applied this criterion, so this trend should be interpreted with caution.
+
+## Summary
+
+::: {.callout-important}
+## Round-over-Round Summary
+
+- **Overall trend is strongly positive** as most criteria improved substantially, with Accuracy and Relevancy showing the largest gains.
+- **Multi-hop Reasoning regressed** on several criteria while other task categories improved, suggesting that changes between rounds benefited simpler tasks at the expense of complex multi-step reasoning.
+- **References declined** across categories, largely attributable to the methodological change from single to averaged reference scores.
+:::
+
+# Additional Analyses
+
+## Recommendation Score Drivers
+
+The Recommend criterion captures the evaluator's overall assessment of whether a response is useful enough to recommend. Understanding which criteria drive Recommend scores can help prioritize improvement efforts.
+
+The table below shows the Spearman rank correlation (ρ) between each evaluation criterion and the Recommend score, along with the number of valid observation pairs (n) used in each comparison. 
+
+::: {.callout-caution}
+## Interpretation caveats
+
+Correlation does not imply causation; a high correlation indicates association but not necessarily that improving one criterion will directly improve Recommend scores.
+:::
+
+```{python}
+# Human criteria vs Recommend — pairwise NaN handling via pandas
+human_criteria = [c for c in eval_cols if c != "Recommend"]
+
+human_rec_rows = []
+for col in human_criteria:
+    valid = df_evals[[col, "Recommend"]].dropna()
+    n = len(valid)
+    rho = valid[col].corr(valid["Recommend"], method="spearman") if n >= 5 else None
+    human_rec_rows.append({"Criterion": col, "ρ": rho, "n": n})
+
+df_human_rec = pd.DataFrame(human_rec_rows).set_index("Criterion").sort_values("ρ", ascending=False)
+```
+
+```{python}
+corr_cmap = LinearSegmentedColormap.from_list(
+    "corr", ["#e88e2d", "#FFF2CF", "#ffffff", "#CFE8F3", "#1696D2"]
+)
+
+df_human_rec.style \
+    .format({"ρ": "{:.2f}", "n": "{:.0f}"}, na_rep="—") \
+    .background_gradient(cmap=corr_cmap, vmin=-1, vmax=1, subset=["ρ"]) \
+    .set_properties(**{'font-weight': 'bold'}) \
+    .set_caption("Spearman Rank Correlations with Recommend Score")
+```
+
+::: {.callout-note collapse="true"}
+## How to read this table
+
+Each row shows the Spearman rank correlation (ρ) between a human evaluation criterion and the Recommend score, computed at the individual rater level. Values range from −1 (inverse relationship) to +1 (positive relationship). The **n** column shows how many valid observation pairs were used — criteria with missing data (e.g., Uncertainty) have fewer pairs. 
+
+*Note: Bias shows "—" because it had no variance (all scores were 5.00), making correlation undefined.*
+:::
+
+```{python}
+#| output: asis
+
+top = df_human_rec.dropna(subset=["ρ"])
+top_driver = top.index[0]
+top_driver_rho = top["ρ"].iloc[0]
+top_driver_n = int(top["n"].iloc[0])
+second_driver = top.index[1]
+second_driver_rho = top["ρ"].iloc[1]
+second_driver_n = int(top["n"].iloc[1])
+weakest_driver = top.index[-1]
+weakest_driver_rho = top["ρ"].iloc[-1]
+
+insights_rec = []
+insights_rec.append(f"- **Strongest predictor of Recommend score**: {top_driver} (ρ = {top_driver_rho:.2f}, n = {top_driver_n}), followed by {second_driver} (ρ = {second_driver_rho:.2f}, n = {second_driver_n})")
+insights_rec.append(f"- **Weakest predictor**: {weakest_driver} (ρ = {weakest_driver_rho:.2f})")
+
+display(Markdown("\n".join(insights_rec)))
+```
+
+::: {.callout-important}
+## Key insights: drivers of recommendation
+
+- **Improving uncertainty and completeness may have the biggest impact** on increasing the model's usefulness as perceived by evaluators.
+- **Evaluators seem to have a more nuanced view of what makes a response recommendable** beyond just accuracy and relevancy. They seem to weigh the model's ability to provide a complete answer and appropriately signal uncertainty as more important for recommendation than just getting the facts right. 
+:::
+
+## Inter-Rater Reliability
+
+The tables below report pairwise and multi-rater agreement for each evaluation criterion. Inter-rater reliability is a methodological check on the consistency of the human evaluation, and can help identify criteria that are more subjective or inconsistently applied across evaluators.
+
+::: {.callout-note collapse="true"}
+## About inter-rater reliability metrics
+
+Inter-rater reliability measures the degree of agreement among evaluators. **Cohen's Kappa** quantifies agreement between pairs of evaluators while accounting for chance agreement. **Krippendorff's Alpha** is a more general coefficient that handles multiple raters and different data types. Both range from -1 to 1, where 1 = perfect agreement, 0 = chance agreement, and negative values = less-than-chance agreement.
+:::
+
+```{python}
+from utils.eval_metrics import calculate_pairwise_weighted_kappa, calculate_krippendorffs_alpha
+from itertools import combinations
+
+_evaluator_names = sorted(df_evals["reviewer"].dropna().unique().tolist())
+
+rows = []
+
+for evaluators in [list(pair) for pair in combinations(_evaluator_names, 2)]:
+    pair = " vs ".join(evaluators)
+    for col in eval_cols:
+        weighted_kappa = calculate_pairwise_weighted_kappa(df_evals, col, evaluators)
+        rows.append({
+            "Evaluator Pair": pair,
+            "Metric": col,
+            "Weighted Cohen's Kappa": weighted_kappa
+        })
+
+df_kappa = pd.DataFrame(rows)
+kappa_wide = df_kappa.pivot(index="Evaluator Pair", columns="Metric", values="Weighted Cohen's Kappa")
+
+custom_cmap_2 = LinearSegmentedColormap.from_list("custom", ["#CA5800","#FDBF11","#FDD870","#FFF2CF","#CFE8F3","#73BFE2","#1696D2","#0a4c6a"])
+
+kappa_wide.style \
+    .format("{:.3f}", na_rep="N/A") \
+    .background_gradient(cmap=custom_cmap_2, vmin=-1, vmax=1) \
+    .set_caption("Inter-Rater Reliability (Weighted Cohen's Kappa)")
+```
+
+::: {.callout-tip collapse="true"}
+## How to interpret Cohen's Kappa scores
+- **0.61 – 0.80**: Substantial agreement
+- **0.41 – 0.60**: Moderate agreement
+- **0.21 – 0.40**: Fair agreement
+- **0.00 – 0.20**: Slight agreement
+- **Negative values**: Less than chance agreement
+
+*Note: Kappa can return "N/A" if there is no variance in ratings of a criterion (e.g., all evaluators gave the same score) or if there are missing values.*
+:::
+
+```{python}
+rows_alpha = []
+
+for col in eval_cols:
+    alpha = calculate_krippendorffs_alpha(df_evals, col)
+    rows_alpha.append({
+        "Metric": col,
+        "Krippendorff's Alpha": alpha
+    })
+
+df_alpha = pd.DataFrame(rows_alpha).set_index("Metric").T
+
+df_alpha.style \
+    .format("{:.3f}", na_rep="N/A") \
+    .background_gradient(cmap=custom_cmap_2, vmin=0, vmax=1) \
+    .set_caption("Inter-Rater Reliability (Krippendorff's Alpha)")
+```
+
+::: {.callout-tip collapse="true"}
+## How to interpret Krippendorff's Alpha scores
+- **≥ 0.800**: Satisfactory agreement
+- **0.667 – 0.800**: Moderate agreement
+- **< 0.667**: Poor agreement
+- **Negative values**: Systematic disagreement
+:::
+
+```{python}
+# Dynamic summary of inter-rater reliability
+best_kappa_col = kappa_wide.mean().idxmax()
+worst_kappa_col = kappa_wide.mean().idxmin()
+best_alpha_col = df_alpha.loc["Krippendorff's Alpha"].idxmax()
+worst_alpha_col = df_alpha.loc["Krippendorff's Alpha"].idxmin()
+
+display(Markdown(f"""
+- **Highest pairwise agreement** (Cohen's Kappa): {best_kappa_col} (avg κ = {kappa_wide[best_kappa_col].mean():.3f})
+- **Lowest pairwise agreement** (Cohen's Kappa): {worst_kappa_col} (avg κ = {kappa_wide[worst_kappa_col].mean():.3f})
+- **Highest multi-rater agreement** (Krippendorff's α): {best_alpha_col} (α = {df_alpha[best_alpha_col].values[0]:.3f})
+- **Lowest multi-rater agreement** (Krippendorff's α): {worst_alpha_col} (α = {df_alpha[worst_alpha_col].values[0]:.3f})
+"""))
+```
+
+::: {.callout-important}
+## Key insights: inter-rater reliability
+
+- **Evaluators overwhelmingly disagreed on most criteria**, with the exception of Bias which had no variance (all scores were 5.00) and thus perfect agreement. This suggests that most **criteria were applied inconsistently across evaluators**.
+- The inter-reliability results should be interpreted with caution because of small sample sizes. However, compared to Round 1 as documented in `06_evaluation-analysis.html`, disagreement appears to have increased in Round 2 possibly due to the change in one evaluator. 
+    - Evaluator A and Evaluator C had moderate agreement in Round 1 which has increased to perfect agreement for Accuracy and Bias in Round 2, while it decreased for all other criteria except References. Uncertainty agreement couldn't be computed as Evaluator C did not rate this criterion in Round 2.
+
+:::
+
+# Recommendations and Next Steps
+
+## Areas for Improvement
+
+The table below summarizes actionable improvement areas each tied to specific findings from this evaluation.
+
+```{python}
+recommendations = pd.DataFrame([
+    {
+        "Area": "Improve retrieval for multi-document questions",
+        "Evidence": "Multi Document was the worst-performing information category (avg 3.83). Retrieval recall (79%) lags behind hit rate (91%), meaning relevant documents are missed."
+    },
+    {
+        "Area": "Improve completeness for synthesis tasks",
+        "Evidence": "Completeness had the largest range across task types (1.40) and is a strong predictor of recommendation scores. Single-hop and Multi-hop responses consistently lacked relevant information."
+    },
+    {
+        "Area": "Calibrate uncertainty signaling for complex tasks",
+        "Evidence": "Uncertainty was perfect (5.00) for simple tasks but scored as low as 3.00 for Multi-hop Reasoning. It is the strongest predictor of recommendation scores."
+    },
+    {
+        "Area": "Reduce response verbosity and noise",
+        "Evidence": "Evaluator feedback flagged noisiness and irrelevant content in multiple responses, which affected relevancy scores even when retrieval performed well."
+    },
+])
+
+recommendations.style \
+    .set_properties(**{'text-align': 'left'}) \
+    .set_table_styles([dict(selector='th', props=[('text-align', 'left')])]) \
+    .hide(axis="index") \
+    .set_caption("Areas for Improvement")
+```
+
+## Future Evaluation Methodology Improvements 
+
+- **Scoring guidelines and rater training need further standardization** to reduce inconsistency and missingness in human evaluations.
+- **Sample size should be increased for underrepresented categories** to enable more reliable analysis for categories like Diffuse Multi Document (1 question) and Requires External Information (2 questions).
+- **Consider evaluating generation models on the same set of questions** to identify true performance differences for smarter model routing and selection.
+- **Investigate techniques for automated refusal detection** to reduce burden on human evaluators and enable scaling of refusal evaluation.
+
+## Open Questions
+
+- **Is the Multi-hop Reasoning regression real?** Performance declined from Round 1 to Round 2 on several criteria. Is this due to changes in document prioritization, different evaluators, or poorer performance on criteria like relevancy and completeness?
+- **What drives the gap between citation quality and recommendation?** Long-form QA and Diffuse Multi Document scored well on References but poorly on Recommendation. Understanding what evaluators consider a good response beyond good citations would help target generation improvements.
+- **Can retrieval improvements alone close the completeness gap?** Understanding the correlation between retrieval metrics and human Completeness scores at the question level would clarify whether better retrieval is sufficient or if generation-side changes (through system prompts) are also needed.
+
+
+# Appendix {.unnumbered}
+
+The following sections contain detailed per-category summary statistics and per-question score breakdowns that support the synthesis presented in the main body of this report.
+
+## A: Human Eval — Summary statistics by task category {.unnumbered}
+
+::: {.panel-tabset}
+
+```{python}
+#| output: asis
+
+for task_df in [df_task_1, df_task_2, df_task_3, df_task_4, df_task_5, df_task_6]:
+    
+    display(Markdown(f"#### {task_df['Task Category'].iloc[0]}"))
+    
+    display(
+        task_df[eval_cols]
+        .agg(["count", "mean", "std", "median"])
+        .round(2)
+        .T
+        .rename(columns={
+            "count": "Question Count",
+            "mean": "Mean",
+            "std": "Std Dev",
+            "median": "Median"
+        })
+    )
+```
+
+:::
+
+## B: Human Eval — Per-question scores by task category {.unnumbered}
+
+:::{.panel-tabset}
+
+```{python}
+#| output: asis
+
+for task_df in [df_task_1, df_task_2, df_task_3, df_task_4, df_task_5, df_task_6]:
+    display(Markdown(f"#### {task_df['Task Category'].iloc[0]}"))
+
+    display(
+        task_df
+        .groupby("question_id")[eval_cols]
+        .mean()
+        .round(2)
+        .sort_index()
+        )    
+```    
+
+:::
+
+## C: Human Eval — Summary statistics by information category {.unnumbered}
+
+::: {.panel-tabset}
+
+```{python}
+#| output: asis
+
+for df_info in [df_single_loc, df_single_doc, df_multi_doc, df_diffuse_multi_doc, df_ext_info]:
+    
+    display(Markdown(f"#### {df_info['Information Category'].iloc[0]}"))
+
+    display(
+        df_info[eval_cols]
+        .agg(["count", "mean", "std", "median"])
+        .round(2)
+        .T
+        .rename(columns={
+            "count": "Question Count",
+            "mean": "Mean",
+            "std": "Std Dev",
+            "median": "Median"
+        })
+    )
+```
+
+:::
+
+## D: Human Eval — Per-question scores by information category {.unnumbered}
+
+:::{.panel-tabset}
+
+```{python}
+#| output: asis
+
+for df_info in [df_single_loc, df_single_doc, df_multi_doc, df_diffuse_multi_doc, df_ext_info]:
+    
+    display(Markdown(f"#### {df_info['Information Category'].iloc[0]}"))
+    
+    display(
+        df_info
+        .groupby("question_id")[eval_cols]
+        .mean()
+        .round(2)
+        .sort_index()
+    )
+```
+
+:::
+
+## E: Human Eval — Generation model performance {.unnumbered}
+
+::: {.panel-tabset}
+```{python}
+#| output: asis
+
+for model_name, df_model in df_evals.groupby("generation_model", sort=False):
+    
+    display(Markdown(f"#### {model_name}"))
+
+    display(
+        df_model[eval_cols]
+        .agg(["count", "mean", "std", "median"])
+        .round(2)
+        .T
+        .rename(columns={
+            "count": "Question Count",
+            "mean": "Mean",
+            "std": "Std Dev",
+            "median": "Median"
+        })
+    )
+
+```
+
+:::
+
+## F: Automated Eval — Summary statistics by task category {.unnumbered}
+
+::: {.panel-tabset}
+
+```{python}
+#| output: asis
+
+for df_task in [df_auto_task_1, df_auto_task_2, df_auto_task_3, df_auto_task_4, df_auto_task_5, df_auto_task_6]:
+    display(Markdown(f"#### {df_task['Task Category'].iloc[0]}"))
+    
+    display(
+        df_task[auto_eval_cols]
+        .agg(["count", "mean", "std", "median"])
+        .round(2)
+        .T
+        .rename(columns={
+            "count": "Question Count",
+            "mean": "Mean",
+            "std": "Std Dev",
+            "median": "Median"
+        })
+    )
+```
+
+:::
+
+## G: Automated Eval — Per-question scores by task category {.unnumbered}
+
+:::{.panel-tabset}
+
+```{python}
+#| output: asis
+
+for task_df in [df_auto_task_1, df_auto_task_2, df_auto_task_3, df_auto_task_4, df_auto_task_5, df_auto_task_6]:
+    display(Markdown(f"#### {task_df['Task Category'].iloc[0]}"))
+
+    display(
+        task_df
+        .groupby("question_id")[auto_eval_cols]
+        .mean()
+        .round(2)
+        .sort_index()
+        )    
+```    
+
+:::
+
+## H: Automated Eval — Summary statistics by information category {.unnumbered}
+
+::: {.panel-tabset}
+
+```{python}
+#| output: asis
+
+for df_info in [df_auto_single_loc, df_auto_single_doc, df_auto_multi_doc, df_auto_diffuse_multi_doc, df_auto_ext_info]:
+    
+    display(Markdown(f"#### {df_info['Information Category'].iloc[0]}"))
+
+    display(
+        df_info[auto_eval_cols]
+        .agg(["count", "mean", "std", "median"])
+        .round(2)
+        .T
+        .rename(columns={
+            "count": "Question Count",
+            "mean": "Mean",
+            "std": "Std Dev",
+            "median": "Median"
+        })
+    )
+```
+
+:::
+
+## I: Automated Eval — Per-question scores by information category {.unnumbered}
+
+:::{.panel-tabset}
+
+```{python}
+#| output: asis
+
+for df_info in [df_auto_single_loc, df_auto_single_doc, df_auto_multi_doc, df_auto_diffuse_multi_doc, df_auto_ext_info]:
+    
+    display(Markdown(f"#### {df_info['Information Category'].iloc[0]}"))
+    
+    display(
+        df_info
+        .groupby("question_id")[auto_eval_cols]
+        .mean()
+        .round(2)
+        .sort_index()
+    )
+```
+
+:::
+
+## J: All Evaluated Questions {.unnumbered}
+
+The table below lists all questions included in this evaluation round, organized by task category and information category.
+
+```{python}
+(
+    df_evals[["question_id", "Task Category", "Information Category", "prompt"]]
+    .drop_duplicates(subset=["question_id"])
+    .fillna("--")
+    .sort_values("question_id")
+    .rename(columns={"question_id": "Question ID", "prompt": "Question"})
+    .reset_index(drop=True)
+    .style.set_properties(**{"text-align": "left"})
+    .hide(axis="index")
+)
+```

@@ -1,0 +1,13 @@
+prompts:
+    - '{{input}}'  
+
+providers:
+  - echo
+
+defaultTest:
+  options:
+    provider:
+      embedding:
+        id: huggingface:sentence-similarity:sentence-transformers/all-MiniLM-L6-v2
+        config:
+          apiKey: '{{env.HF_TOKEN}}'
