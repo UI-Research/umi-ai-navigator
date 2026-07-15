@@ -2,6 +2,8 @@
 
 This README covers the end-to-end pipeline for building, testing, and evaluating the UMI Bedrock Knowledge Base. Each numbered script is designed to run in sequence.
 
+**Our [full evaluation methodology](full-evaluation-methodology.xlsx) is readable on its own with no code to run and includes our evaluation criteria, measures, and full matrix of questions.**
+
 ---
 
 ## Setup
